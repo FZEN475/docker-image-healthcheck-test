@@ -1,0 +1,244 @@
+# templates/docker-healthcheck/template.yml
+spec:
+  inputs:
+    docker-healthcheck:
+      description: "Enable docker-healthcheck"
+      type: boolean
+      default: true
+    docker-image:
+      description: |-
+        The image used to run the docker client
+      type: string
+      default: docker.io/library/docker:latest
+    stage:
+      description: "Job stage"
+      type: string
+      default: "package-test"
+    verified-image:
+      description: "Docker image that will be checked by the healthcheck process"
+      type: string
+      default: ""
+    docker-host:
+      description: |-
+        tcp connection to remote docker
+      type: string
+    docker-healthcheck-args:
+      description: |-
+        Additional arguments passed to Docker for healthcheck container (e.g. --network, --env).
+      type: string
+      default: ""
+    docker-container-args:
+      description: |-
+        Additional arguments passed directly to the main docker run command.
+      type: string
+      default: ""
+---
+
+include:
+  - local: templates/ci-remote-exec-core/template.yml
+
+variables:
+  DOCKER_HEALTHCHECK_IMAGE: $[[ inputs.docker-image ]]
+  VERIFIED_RELEASE_IMAGE: $[[ inputs.verified-image ]]
+  DOCKER_HOST: $[[ inputs.docker-host ]]
+  DOCKER_HEALTHCHECK_ARGS: $[[ inputs.docker-healthcheck-args ]]
+  DOCKER_HEALTHCHECK_CONTAINER_ARGS: $[[ inputs.docker-container-args ]]
+
+
+.ci-remote-exec:docker-healthcheck:public:env-overwrite:
+  - |
+    true
+
+.ci-remote-exec:docker-healthcheck:public:rules-extends:
+  - when: on_success
+
+.ci-remote-exec:docker-healthcheck:public:extends:
+  tags: []
+
+.ci-remote-exec:docker-healthcheck:public:needs:
+  -
+
+.ci-remote-exec:docker-healthcheck:internal:report-scripts: |
+  REPORT_FILE="reports/docker-healthcheck-report.log"
+  mkdir -p reports
+  init_report() {
+    {
+      echo "==== Docker Healthcheck Report ===="
+      echo "Time: $(date -Is)"
+      echo "Image: $VERIFIED_RELEASE_IMAGE"
+      echo "Timeout: $DOCKER_HEALTHCHECK_TIMEOUT"
+      echo "Args: $DOCKER_HEALTHCHECK_ARGS"
+      echo "Container Args: $DOCKER_HEALTHCHECK_CONTAINER_ARGS"
+      echo "==================================="
+      echo
+    } > "$REPORT_FILE"
+  }
+    
+  append_report() {
+    echo "$1" >> "$REPORT_FILE"
+  }
+
+  function unexpected_error() {
+    log_error "Unexpected error"
+  
+    append_report ""
+    append_report "==== UNEXPECTED ERROR ===="
+    append_report "Time: $(date -Is)"
+    append_report "Container: ${container_id:-unknown}"
+    append_report ""
+    append_report "==== Container logs ===="
+  
+    docker logs "$container_id" 2>&1 | tee -a "$REPORT_FILE"
+  
+    append_report ""
+    append_report "==== Docker inspect ===="
+  
+    docker inspect "$container_id" 2>&1 | tee -a "$REPORT_FILE"
+  
+    exit 1
+  }
+
+  print_diagnostics() {
+    log_info "Container logs:"
+    append_report "==== Container logs ===="
+    docker logs "$container_id" 2>&1 | tee -a "$REPORT_FILE"
+  
+    log_info "Docker inspect:"
+    append_report ""
+    append_report "==== Docker inspect ===="
+    docker inspect "$container_id" 2>&1 | tee -a "$REPORT_FILE"
+  }
+
+  finalize_result() {
+    append_report "==== RESULT ===="
+    append_report "Healthcheck result: $healthcheck_result"
+  
+    if [ "$healthcheck_result" == "healthy" ]; then
+      append_report "Status: OK"
+      log_info "Container is healthy"
+    else
+      append_report "Status: FAIL"
+      append_report "Reason: $healthcheck_result"
+  
+      log_error "HealthCheck test error, reason: $healthcheck_result"
+      echo -e "Full logs:\n$full_result"
+  
+      print_diagnostics
+      exit 1
+      fi
+  
+    append_report "Report saved to: $REPORT_FILE"
+  }
+
+.ci-remote-exec:docker-healthcheck:internal:core-scripts: |
+  docker info
+  if ! docker --debug pull "$VERIFIED_RELEASE_IMAGE"; then
+    log_error "Failed to pull image: $VERIFIED_RELEASE_IMAGE" >&2
+    exit 1
+  fi
+
+  run_container() {
+    timestamp_from=$(( $(date +%s) - 1 ))
+    container_id=$(docker run -d $DOCKER_HEALTHCHECK_ARGS $VERIFIED_RELEASE_IMAGE $DOCKER_HEALTHCHECK_CONTAINER_ARGS)
+    log_info "container_id=$container_id"
+  }
+  
+  check_health() {
+    waiting_time=0
+    healthcheck_result="timeout"
+  
+    while [ $waiting_time -lt $DOCKER_HEALTHCHECK_TIMEOUT ] \
+      && [ "$healthcheck_result" != "healthy" ] \
+      && [ "$healthcheck_result" != "dead" ]
+    do
+      waiting_time=$(( waiting_time + 5 ))
+      timestamp_to=$(( timestamp_from + waiting_time ))
+    
+      log_info "Testing events between $timestamp_from and $timestamp_to ..."
+    
+      full_result=$(docker events \
+        --filter container=$container_id \
+        --format="{{.Action}}" \
+        --since $timestamp_from \
+        --until $timestamp_to) || unexpected_error
+      
+      append_report "==== EVENTS [$timestamp_from - $timestamp_to] ===="
+      append_report "$full_result"
+      append_report ""
+      
+      if echo "$full_result" | grep ': healthy$' >/dev/null; then
+        healthcheck_result="healthy"
+      
+      elif echo "$full_result" | grep ': unhealthy$' >/dev/null; then
+        log_warn "\\e[93mContainer is unhealthy\\e[0m"
+        healthcheck_result="unhealthy"
+        
+      elif echo "$full_result" | grep '^die$' >/dev/null; then
+        log_error "Container died"
+        healthcheck_result="dead"
+        
+      else
+        healthcheck_result="timeout"
+      fi
+    done
+  }
+  
+  cleanup_container() {
+    docker stop $container_id >/dev/null 2>&1
+    docker rm $container_id >/dev/null 2>&1
+  
+    max_wait=10
+    waited=0
+  
+    while docker ps -a -q --filter "id=$container_id" | grep -q .; do
+      sleep 1
+      waited=$((waited + 1))
+    
+      if [ $waited -ge $max_wait ]; then
+        log_warn "Container $container_id is not removed after $max_wait seconds"
+        break
+      fi
+    done
+  
+    log_info "Container $container_id stopped and removed"
+  }
+
+ci-remote-exec:docker-healthcheck:core:
+  extends:
+    - .utils:toolkit:shared:package-cache
+    - .ci-remote-exec:docker-healthcheck:public:extends
+  image: $DOCKER_HEALTHCHECK_IMAGE
+  stage: $[[ inputs.stage ]]
+  variables:
+    DOCKER_CLIENT_TIMEOUT: 600
+    COMPOSE_HTTP_TIMEOUT: 600
+    DOCKER_HEALTHCHECK_TIMEOUT: 60
+  needs:
+    - !reference [ .ci-remote-exec:docker-healthcheck:public:needs ]
+  before_script:
+    - !reference [ .utils:toolkit:shared:logs-scripts ]
+    - !reference [ .ci-remote-exec:docker-healthcheck:public:env-overwrite ]
+    - !reference [ .mirroring:ci-remote-exec:shared:tbc_common ]
+    - !reference [ .mirroring:ci-remote-exec:shared:registries_auth ]
+    - !reference [ .ci-remote-exec:docker-healthcheck:internal:report-scripts ]
+    - !reference [ .ci-remote-exec:docker-healthcheck:internal:core-scripts ]
+  script:
+    - log_info "Healthchecking ${VERIFIED_RELEASE_IMAGE}..."
+    - |
+
+      init_report
+      run_container
+      check_health
+      print_diagnostics
+      cleanup_container
+      finalize_result
+  artifacts:
+    name: "docker-healthcheck from $CI_PROJECT_NAME on $CI_COMMIT_REF_SLUG"
+    expire_in: 1 week
+    when: always
+    paths:
+      - "reports/docker-healthcheck-report.log"
+  rules:
+    - if: '"$[[ inputs.docker-healthcheck ]]" != "true"'
+      when: never
+    - !reference [ .ci-remote-exec:docker-healthcheck:public:rules-extends ]

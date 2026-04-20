@@ -1,0 +1,8 @@
+include:
+  - local: 'templates/docker-healthcheck/template.yml'
+    inputs:
+      stage: package-test
+      verified-image: "registry.gitlab.fizn.ru:443/library/docker-images/local-tests/terraform-qa-kit:main"
+      docker-host: "tcp://workflow01:2376"
+      docker-healthcheck-args: "--entrypoint sleep"
+      docker-container-args: "infinity"
