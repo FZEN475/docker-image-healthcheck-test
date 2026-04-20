@@ -1,0 +1,32 @@
+
+include:
+  - local: '.gitlab-ci.docker-image-healthcheck-test.yml'
+
+variables:
+  CI_DEBUG_TRACE: "false"
+  DOCKER_CONFIG_FILE: "/tmp/config.json"
+  DOCKER_IMAGE: "docker.io/library/docker:latest"
+  DOCKER_BUILD_TOOL: "buildah"
+
+  DOCKER_HEALTHCHECK_OPTIONS: ""
+  DOCKER_HEALTHCHECK_CONTAINER_ARGS: ""
+  DOCKER_HEALTHCHECK_TIMEOUT: 60  
+  
+  REGISTRY_IMAGE: "gitlab-registry.gitlab.svc:5000/library/cicd/examples/tbc-docker/buildah:0.9.0"
+
+  DOCKER_HOST: "tcp://192.168.2.129:2375"
+  GLOBAL_REGISTRY_URL: "gitlab-registry.fizn.ru"
+
+stages:
+  - package-test
+  - release
+
+create-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  script: echo "Creating release $CI_COMMIT_TAG"
+  rules:
+    - if: $CI_COMMIT_TAG
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: "Release $CI_COMMIT_TAG of components in $CI_PROJECT_PATH"

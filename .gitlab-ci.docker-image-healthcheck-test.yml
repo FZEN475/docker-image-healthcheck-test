@@ -1,0 +1,676 @@
+include:
+  - component: $CI_SERVER_FQDN/library/cicd/utils/utils@~latest
+  - local: 'templates/remote-docker/template.yml'
+
+# test job prototype: implement adaptive pipeline rules
+.test-policy:
+  rules:
+    # on tag: auto & failing
+    - if: $CI_COMMIT_TAG
+    # on ADAPTIVE_PIPELINE_DISABLED: auto & failing
+    - if: '$ADAPTIVE_PIPELINE_DISABLED == "true"'
+    # on production or integration branch(es): auto & failing
+    - if: '$CI_COMMIT_REF_NAME =~ $PROD_REF || $CI_COMMIT_REF_NAME =~ $INTEG_REF'
+    # early stage (dev branch, no MR): manual & non-failing
+    - if: '$CI_MERGE_REQUEST_ID == null && $CI_OPEN_MERGE_REQUESTS == null'
+      when: manual
+      allow_failure: true
+    # Draft MR: auto & non-failing
+    - if: '$CI_MERGE_REQUEST_TITLE =~ /^Draft:.*/'
+      allow_failure: true
+    # else (Ready MR): auto & failing
+    - when: on_success
+
+.docker-scripts: &docker-scripts |
+  # BEGSCRIPT
+  set -eo pipefail
+
+  function log_info() {
+      echo -e "[\\e[1;94mINFO\\e[0m] $*"
+  }
+
+  function log_warn() {
+      echo -e "[\\e[1;93mWARN\\e[0m] $*"
+  }
+
+  function log_error() {
+      echo -e "[\\e[1;91mERROR\\e[0m] $*"
+  }
+
+  function fail() {
+    log_error "$*"
+    exit 1 
+  }
+
+  function as_content() {
+    file_or_content=$1
+    if [[ -f "${file_or_content}" ]]; then
+      cat "${file_or_content}"
+    else
+      echo "${file_or_content}"
+    fi
+  }
+
+  function install_ca_certs() {
+    certs="${CUSTOM_CA_CERTS:-$DEFAULT_CA_CERTS}"
+    if [[ -z "$certs" ]]
+    then
+      return
+    fi
+    # import in system for regular linux (Ubuntu, Debian) image
+    if [[ -w /etc/ssl/certs/ca-certificates.crt ]]
+    then
+      as_content "$certs" | tr -d '\r' >> /etc/ssl/certs/ca-certificates.crt
+      log_info "Custom CA certificates imported in \\e[33;1m/etc/ssl/certs/ca-certificates.crt\\e[0m"
+    # import in system for regular linux (Fedora, RHEL) image (e.g. Skopeo image)
+    elif [[ -f /etc/ssl/certs/ca-bundle.crt ]]
+    then
+      as_content "$certs" | tr -d '\r' >> /etc/ssl/certs/ca-bundle.crt
+      log_info "Custom CA certificates imported in \\e[33;1m/etc/ssl/certs/ca-bundle.crt\\e[0m"
+    # kaniko image : specific directory for ca certificates, no standard import tool
+    elif [[ -d /kaniko/ssl/certs ]]
+    then
+      as_content "$certs" | tr -d '\r' >> /kaniko/ssl/certs/ca-certificates.crt
+      log_info "Custom CA certificates imported in \\e[33;1m/kaniko/ssl/certs/ca-certificates.crt\\e[0m"
+    # for syft : loaded with environment variable
+    else
+      as_content "$certs" | tr -d '\r' >> /tmp/ca-certificates.crt
+      log_info "Custom CA certificates imported in \\e[33;1m/tmp/ca-certificates.crt\\e[0m"
+    fi
+  }
+
+  function maybe_install_awk() {
+    if ! command -v awk > /dev/null
+    then
+      if command -v apt-get > /dev/null
+      then
+        # Debian
+        apt-get update
+        apt-get install --no-install-recommends --yes --quiet awk
+      elif command -v apk > /dev/null
+      then
+        # Alpine
+        apk add --no-cache gawk
+      elif command -v dnf > /dev/null
+      then 
+        # Fedora
+        dnf install -y -q awk
+      else
+        log_error "... didn't find any supported package manager to install awk"
+        exit 1
+      fi
+    fi
+  }
+
+  function maybe_install_python3() {
+    if ! command -v python3 > /dev/null
+    then
+      if command -v apt-get > /dev/null
+      then
+        # Debian
+        apt-get update
+        apt-get install --no-install-recommends --yes --quiet python3
+      elif command -v apk > /dev/null
+      then
+        # Alpine
+        apk add --no-cache python3
+      elif command -v dnf > /dev/null
+      then 
+        # Fedora
+        dnf install -y -q python3
+      else
+        log_error "... didn't find any supported package manager to install python3"
+        exit 1
+      fi
+    fi
+  }
+
+  function github_get_latest_version() {
+    if command -v curl &> /dev/null
+    then
+      curl -sSf -I "https://github.com/$1/releases/latest" | awk -F '/' -v RS='\r\n' '/location:/ {print $NF}'
+    elif command -v wget &> /dev/null
+    then
+      wget -q -S -O - "https://github.com/$1/releases/latest" 2>&1 | awk -F '/' '/^ *Location:/ {print $NF}'
+    elif command -v python3 &> /dev/null
+    then
+      python3 -c "import urllib.request;url='https://github.com/$1/releases/latest';opener=urllib.request.build_opener(type('NoRedirection', (urllib.request.HTTPErrorProcessor,), {'http_response': lambda self, req, resp: resp, 'https_response': lambda self, req, resp: resp})());req=urllib.request.Request(url, method='HEAD');print(opener.open(req).headers.get('Location').split('/')[-1])"
+    else
+      fail "curl or wget or python3 required"
+    fi
+  }
+
+  function install_cosign() {
+    if command -v cosign &> /dev/null
+    then
+      log_info "\\e[32mcosign\\e[0m is already installed"
+      docker_cosign="cosign"
+    else
+      if [[ -z "$DOCKER_COSIGN_DIST_URL" ]]
+      then
+        log_info "Cosign version unset: retrieve latest version..."
+        cosign_version=$(github_get_latest_version sigstore/cosign)
+        DOCKER_COSIGN_DIST_URL="https://github.com/sigstore/cosign/releases/download/${cosign_version}/cosign-linux-amd64"
+        log_info "... use latest Cosign version: \\e[32m$DOCKER_COSIGN_DIST_URL\\e[0m"
+      fi
+      docker_cosign="$CI_PROJECT_DIR/.cache/cosign-$(echo "$DOCKER_COSIGN_DIST_URL" | md5sum | cut -d" " -f1)"
+      if [[ -f $docker_cosign ]]
+      then
+        log_info "Cosign found in cache (\\e[32m$DOCKER_COSIGN_DIST_URL\\e[0m): reuse"
+      else
+        log_info "Cosign not found in cache (\\e[32m$DOCKER_COSIGN_DIST_URL\\e[0m): download"
+        if command -v curl > /dev/null
+        then
+          curl -L -o cosign "$DOCKER_COSIGN_DIST_URL"
+        elif command -v wget > /dev/null
+        then
+          wget -O cosign "$DOCKER_COSIGN_DIST_URL"
+        fi
+  
+        mkdir -p "$CI_PROJECT_DIR/.cache"
+        # shellcheck disable=SC2086
+        mv ./cosign $docker_cosign
+        # shellcheck disable=SC2086
+        chmod a+x $docker_cosign
+      fi
+    fi
+    export docker_cosign
+  }
+
+  function unscope_variables() {
+    _scoped_vars=$(env | awk -F '=' "/^scoped__[a-zA-Z0-9_]+=/ {print \$1}" | sort)
+    if [[ -z "$_scoped_vars" ]]; then return; fi
+    log_info "Processing scoped variables..."
+    for _scoped_var in $_scoped_vars
+    do
+      _fields=${_scoped_var//__/:}
+      _condition=$(echo "$_fields" | cut -d: -f3)
+      case "$_condition" in
+      if) _not="";;
+      ifnot) _not=1;;
+      *)
+        log_warn "... unrecognized condition \\e[1;91m$_condition\\e[0m in \\e[33;1m${_scoped_var}\\e[0m"
+        continue
+      ;;
+      esac
+      _target_var=$(echo "$_fields" | cut -d: -f2)
+      _cond_var=$(echo "$_fields" | cut -d: -f4)
+      _cond_val=$(eval echo "\$${_cond_var}")
+      _test_op=$(echo "$_fields" | cut -d: -f5)
+      case "$_test_op" in
+      defined)
+        if [[ -z "$_not" ]] && [[ -z "$_cond_val" ]]; then continue;
+        elif [[ "$_not" ]] && [[ "$_cond_val" ]]; then continue;
+        fi
+        ;;
+      equals|startswith|endswith|contains|in|equals_ic|startswith_ic|endswith_ic|contains_ic|in_ic)
+        # comparison operator
+        # sluggify actual value
+        _cond_val=$(echo "$_cond_val" | tr '[:punct:]' '_')
+        # retrieve comparison value
+        _cmp_val_prefix="scoped__${_target_var}__${_condition}__${_cond_var}__${_test_op}__"
+        _cmp_val=${_scoped_var#"$_cmp_val_prefix"}
+        # manage 'ignore case'
+        if [[ "$_test_op" =~ _ic$ ]]
+        then
+          # lowercase everything
+          _cond_val=$(echo "$_cond_val" | tr '[:upper:]' '[:lower:]')
+          _cmp_val=$(echo "$_cmp_val" | tr '[:upper:]' '[:lower:]')
+        fi
+        case "$_test_op" in
+        equals*)
+          if [[ -z "$_not" ]] && [[ "$_cond_val" != "$_cmp_val" ]]; then continue;
+          elif [[ "$_not" ]] && [[ "$_cond_val" == "$_cmp_val" ]]; then continue;
+          fi
+          ;;
+        startswith*)
+          if [[ -z "$_not" ]] && [[ ! "$_cond_val" =~ ^"$_cmp_val" ]]; then continue;
+          elif [[ "$_not" ]] && [[ "$_cond_val" =~ ^"$_cmp_val" ]]; then continue;
+          fi
+          ;;
+        endswith*)
+          if [[ -z "$_not" ]] && [[ ! "$_cond_val" =~ "$_cmp_val"$ ]]; then continue;
+          elif [[ "$_not" ]] && [[ "$_cond_val" =~ "$_cmp_val"$ ]]; then continue;
+          fi
+          ;;
+        contains*)
+          # shellcheck disable=SC2076
+          if [[ -z "$_not" ]] && [[ ! "$_cond_val" =~ "$_cmp_val" ]]; then continue;
+          elif [[ "$_not" ]] && [[ "$_cond_val" =~ "$_cmp_val" ]]; then continue;
+          fi
+          ;;
+        in*)
+          if [[ -z "$_not" ]] && [[ ! __"$_cmp_val"__ =~ __"$_cond_val"__ ]]; then continue;
+          elif [[ "$_not" ]] && [[ __"$_cmp_val"__ =~ __"$_cond_val"__ ]]; then continue;
+          fi
+          ;;
+        esac
+        ;;
+      *)
+        log_warn "... unrecognized test operator \\e[1;91m${_test_op}\\e[0m in \\e[33;1m${_scoped_var}\\e[0m"
+        continue
+        ;;
+      esac
+      # matches
+      _val=$(eval echo "\$${_target_var}")
+      log_info "... apply \\e[32m${_target_var}\\e[0m from \\e[32m\$${_scoped_var}\\e[0m${_val:+ (\\e[33;1moverwrite\\e[0m)}"
+      _val=$(eval echo "\$${_scoped_var}")
+      export "${_target_var}"="${_val}"
+    done
+    log_info "... done"
+  }
+
+  # evaluate and export a secret
+  # - $1: secret variable name
+  function eval_secret() {
+    name=$1
+    value=$(eval echo "\$${name}")
+    # create the /tmp directory (it is required by the mktemp command)
+    mkdir -p /tmp
+    case "$value" in
+    @b64@*)
+      decoded=$(mktemp)
+      errors=$(mktemp)
+      if echo "$value" | cut -c6- | base64 -d > "${decoded}" 2> "${errors}"
+      then
+        # shellcheck disable=SC2086
+        export ${name}="$(cat ${decoded})"
+        log_info "Successfully decoded base64 secret \\e[33;1m${name}\\e[0m"
+      else
+        fail "Failed decoding base64 secret \\e[33;1m${name}\\e[0m:\\n$(sed 's/^/... /g' "${errors}")"
+      fi
+      ;;
+    @hex@*)
+      decoded=$(mktemp)
+      errors=$(mktemp)
+      if echo "$value" | cut -c6- | sed 's/\([0-9A-F]\{2\}\)/\\\\x\1/gI' | xargs printf > "${decoded}" 2> "${errors}"
+      then
+        # shellcheck disable=SC2086
+        export ${name}="$(cat ${decoded})"
+        log_info "Successfully decoded hexadecimal secret \\e[33;1m${name}\\e[0m"
+      else
+        fail "Failed decoding hexadecimal secret \\e[33;1m${name}\\e[0m:\\n$(sed 's/^/... /g' "${errors}")"
+      fi
+      ;;
+    @url@*)
+      url=$(echo "$value" | cut -c6-)
+      if command -v curl > /dev/null
+      then
+        decoded=$(mktemp)
+        errors=$(mktemp)
+        if curl -s -S -f --connect-timeout "${TBC_SECRET_URL_TIMEOUT:-5}" -o "${decoded}" "$url" 2> "${errors}"
+        then
+          # shellcheck disable=SC2086
+          export ${name}="$(cat ${decoded})"
+          log_info "Successfully curl'd secret \\e[33;1m${name}\\e[0m"
+        else
+          log_warn "Failed getting secret \\e[33;1m${name}\\e[0m:\\n$(sed 's/^/... /g' "${errors}")"
+        fi
+      elif command -v wget > /dev/null
+      then
+        decoded=$(mktemp)
+        errors=$(mktemp)
+        if wget -T "${TBC_SECRET_URL_TIMEOUT:-5}" -O "${decoded}" "$url" 2> "${errors}"
+        then
+          # shellcheck disable=SC2086
+          export ${name}="$(cat ${decoded})"
+          log_info "Successfully wget'd secret \\e[33;1m${name}\\e[0m"
+        else
+          log_warn "Failed getting secret \\e[33;1m${name}\\e[0m:\\n$(sed 's/^/... /g' "${errors}")"
+        fi
+      else
+        log_warn "Couldn't get secret \\e[33;1m${name}\\e[0m: no http client found"
+      fi
+      ;;
+    esac
+  }
+
+  function eval_all_secrets() {
+    # exclude scoped variables and their copies passed to container services (`<service_name>_ENV_scoped__xxx`)
+    encoded_vars=$(env | awk -F '=' '$1 !~ /(^|_ENV_)scoped__/ && $2 ~ /^@(b64|hex|url)@/ {print $1}')
+    for var in $encoded_vars
+    do
+      eval_secret "$var"
+    done
+  }
+
+  # simple JSON merge (used in Skopeo job only)
+  function merge_json() {
+    python3 -c "import json,sys
+  def merge(a,b):
+    for key in b:
+      if key in a and isinstance(a[key],dict) and isinstance(b[key],dict): a[key]=merge(a[key],b[key])
+      else: a[key]=b[key]
+    return a
+  def mergef(*files):
+    res={}
+    for f in files:
+      with open(f,'r') as rd: res=merge(res,json.load(rd))
+    return res
+  print(json.dumps(mergef(*sys.argv[1:])))" "$@"
+  }
+
+  function wait_for_docker_daemon() {
+    log_info "Wait for Docker daemon..."
+    # shellcheck disable=SC2034
+    for i in $(seq 1 30); do
+      if ! docker info &> /dev/null; then
+        log_info "... not responding: wait"
+        sleep 2
+      else
+        log_info "... ready: continue"
+        return
+      fi
+    done
+    fail "... timeout reached: halt"
+  }
+
+  function tbc_envsubst() {
+    awk '
+      BEGIN {
+        count_replaced_lines = 0
+        # ASCII codes
+        for (i=0; i<=255; i++)
+          char2code[sprintf("%c", i)] = i
+      }
+      # determine encoding (from env or from file extension)
+      function encoding() {
+        enc = ENVIRON["TBC_ENVSUBST_ENCODING"]
+        if (enc != "")
+          return enc
+        if (match(FILENAME, /\.(json|yaml|yml)$/))
+          return "jsonstr"
+        return "raw"
+      }
+      # see: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/encodeURIComponent
+      function uriencode(str) {
+        len = length(str)
+        enc = ""
+        for (i=1; i<=len; i++) {
+          c = substr(str, i, 1);
+          if (index("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.!~*'\''()", c))
+            enc = enc c
+          else
+            enc = enc "%" sprintf("%02X", char2code[c])
+        }
+        return enc
+      }
+      /# *nosubst/ {
+        print $0
+        next
+      }
+      {
+        orig_line = $0
+        line = $0
+        count_repl_in_line = 0
+        # /!\ 3rd arg (match) not supported in BusyBox awk
+        while (match(line, /[$%]\{([[:alnum:]_]+)\}/)) {
+          expr_start = RSTART
+          expr_len = RLENGTH
+          # get var name
+          var = substr(line, expr_start+2, expr_len-3)
+          # get var value (from env)
+          val = ENVIRON[var]
+          # check variable is set
+          if (val == "") {
+            printf("[\033[1;93mWARN\033[0m] Environment variable \033[33;1m%s\033[0m is not set or empty\n", var) > "/dev/stderr"
+          } else {
+            enc = encoding()
+            if (enc == "jsonstr") {
+              gsub(/["\\]/, "\\\\&", val)
+              gsub("\n", "\\n", val)
+              gsub("\r", "\\r", val)
+              gsub("\t", "\\t", val)
+            } else if (enc == "uricomp") {
+              val = uriencode(val)
+            } else if (enc == "raw") {
+            } else {
+              printf("[\033[1;93mWARN\033[0m] Unsupported encoding \033[33;1m%s\033[0m: ignored\n", enc) > "/dev/stderr"
+            }
+          }
+          # replace expression in line
+          line = substr(line, 1, expr_start - 1) val substr(line, expr_start + expr_len)
+          count_repl_in_line++
+        }
+        if (count_repl_in_line) {
+          if (count_replaced_lines == 0)
+            printf("[\033[1;94mINFO\033[0m] Variable expansion occurred in file \033[33;1m%s\033[0m:\n", FILENAME) > "/dev/stderr"
+          count_replaced_lines++
+          printf("> line %s: %s\n", NR, orig_line) > "/dev/stderr"
+        }
+        print line
+      }
+    ' "$@"
+  }
+
+  function configure_registries_auth() {
+    docker_snapshot_authent_token=$(echo -n "${DOCKER_REGISTRY_SNAPSHOT_USER:-${DOCKER_REGISTRY_USER:-$CI_REGISTRY_USER}}:${DOCKER_REGISTRY_SNAPSHOT_PASSWORD:-${DOCKER_REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD}}" | base64 | tr -d '\n')
+    docker_snapshot_registry_host=$(echo "$DOCKER_SNAPSHOT_IMAGE" | cut -d/ -f1)
+    export docker_snapshot_authent_token
+    export docker_snapshot_registry_host
+
+    docker_release_authent_token=$(echo -n "${DOCKER_REGISTRY_RELEASE_USER:-${DOCKER_REGISTRY_USER:-$CI_REGISTRY_USER}}:${DOCKER_REGISTRY_RELEASE_PASSWORD:-${DOCKER_REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD}}" | base64 | tr -d '\n')
+    docker_release_registry_host=$(echo "$DOCKER_RELEASE_IMAGE" | cut -d/ -f1)
+    export docker_release_authent_token
+    export docker_release_registry_host
+
+    if [[ -n "$DOCKER_REGISTRY_MIRROR" && -n "$DOCKER_REGISTRY_MIRROR_USER" ]]
+    then
+      docker_mirror_authent_token=$(echo -n "$DOCKER_REGISTRY_MIRROR_USER:$DOCKER_REGISTRY_MIRROR_PASSWORD" | base64 | tr -d '\n')
+      # shellcheck disable=SC2001
+      docker_mirror_registry_host=$(echo "$DOCKER_REGISTRY_MIRROR" | sed "s|^https*://||" | cut -d/ -f1)
+      export docker_mirror_authent_token
+      export docker_mirror_registry_host
+
+      docker_mirror_config_json="\"$docker_mirror_registry_host\":{\"auth\":\"$docker_mirror_authent_token\"},"
+    fi
+
+    docker_snapshot_config_json=$(echo -n "{\"auths\":{$docker_mirror_config_json\"$docker_snapshot_registry_host\":{\"auth\":\"$docker_snapshot_authent_token\"}},\"HttpHeaders\":{\"User-Agent\":\"$USER_AGENT\"}}")
+    docker_release_config_json=$(echo -n "{\"auths\":{$docker_mirror_config_json\"$docker_release_registry_host\":{\"auth\":\"$docker_release_authent_token\"}},\"HttpHeaders\":{\"User-Agent\":\"$USER_AGENT\"}}")
+
+    # Create the configuration file for Docker and Kaniko
+    BUILDTOOL_HOME=${BUILDTOOL_HOME:-$HOME}
+    mkdir -p "$BUILDTOOL_HOME/.docker"
+    if [ -f "${DOCKER_CONFIG_FILE}" ]
+    then
+      TBC_ENVSUBST_ENCODING=jsonstr tbc_envsubst "${DOCKER_CONFIG_FILE}" > "$BUILDTOOL_HOME/.docker/config.json"
+    else
+      echo "${docker_snapshot_config_json}" > "$BUILDTOOL_HOME/.docker/config.json"
+    fi
+
+    # Create the configuration files for Skopeo
+    if command -v skopeo > /dev/null
+    then
+      mkdir -p "$BUILDTOOL_HOME/skopeo/.docker"
+      # use same auth config as the build tool for the source image
+      cp -f "$BUILDTOOL_HOME/.docker/config.json" "$BUILDTOOL_HOME/skopeo/.docker/src-config.json"
+      # use a merged auth config for the destination image
+      echo "${docker_release_config_json}" > "$BUILDTOOL_HOME/skopeo/.docker/release-only.json"
+      maybe_install_python3
+      if [ -f "${DOCKER_CONFIG_FILE}" ]
+      then
+        # $DOCKER_CONFIG_FILE takes precedence => src-config.json last
+        merge_json "$BUILDTOOL_HOME/skopeo/.docker/release-only.json" "$BUILDTOOL_HOME/skopeo/.docker/src-config.json" > "$BUILDTOOL_HOME/skopeo/.docker/dest-config.json"
+      else
+        # RELEASE auth takes precedence over SNAPSHOT => release-only.json last
+        merge_json "$BUILDTOOL_HOME/skopeo/.docker/src-config.json" "$BUILDTOOL_HOME/skopeo/.docker/release-only.json" > "$BUILDTOOL_HOME/skopeo/.docker/dest-config.json"
+      fi
+    fi
+
+    if [ "$docker_snapshot_registry_host" = "$docker_release_registry_host" ]
+    then
+      log_info "Docker authentication configured for \\e[33;1m${docker_snapshot_registry_host}\\e[0m ${docker_mirror_registry_host+and \\e[33;1m${docker_mirror_registry_host}\\e[0m}"
+    else
+      log_info "Docker authentication configured for \\e[33;1m${docker_snapshot_registry_host}\\e[0m and \\e[33;1m${docker_release_registry_host}\\e[0m ${docker_mirror_registry_host+and \\e[33;1m${docker_mirror_registry_host}\\e[0m}"
+    fi
+  }
+
+  # autodetects whether there is an hadolint config file
+  function autoconfig_hadolint() {
+    # If present, import hadolint config found inside the git repository
+    _cfg=$(ls -1 "hadolint.yaml" 2>/dev/null || ls -1 ".hadolint.yaml" 2>/dev/null || echo "")
+    if [[ -f "$_cfg" ]]
+    then
+      log_info "Using custom Hadolint config (\\e[33;1m${_cfg}\\e[0m)"
+      export hadolint_config_opts="--config $_cfg"
+    else
+      log_info "No Hadolint config found: use default"
+    fi
+  }
+
+  function create_kaniko_cache_dir() {
+    # create cache directory if needed
+    mkdir -p "${CI_PROJECT_DIR}/.cache"
+  }
+
+  function init_workspace() {
+    install_ca_certs
+    maybe_install_awk
+    unscope_variables
+    eval_all_secrets
+    configure_registries_auth
+  }
+
+  # evaluate the context path
+  function docker_context_path() {
+    if [[ "$DOCKER_CONTEXT_PATH" ]]
+    then
+      # $DOCKER_CONTEXT_PATH is explicit: use it
+      echo "$DOCKER_CONTEXT_PATH"
+    else
+      # $DOCKER_CONTEXT_PATH unset or empty: assume it's relative to the Dockerfile
+      dirname "$DOCKER_FILE"
+    fi
+  }
+
+  function run_build_kaniko() {
+    docker_image=$1
+    if [ "$DOCKER_BUILD_CACHE_DISABLED" != "true" ]; then
+      # Backward compatibility until buildah become the default build tool
+      kaniko_snapshot_image_cache="${KANIKO_SNAPSHOT_IMAGE_CACHE:-${DOCKER_BUILD_CACHE_LOCATION:-${DOCKER_SNAPSHOT_IMAGE%:*}/cache}}"
+      kaniko_cache_args="--cache --cache-dir=${CI_PROJECT_DIR}/.cache --cache-repo=${kaniko_snapshot_image_cache}"
+      log_info "Build cache enabled; CLI options: ${kaniko_cache_args}"
+    fi
+    shift
+    if [[ -n "$DOCKER_REGISTRY_MIRROR" ]]
+    then
+      # shellcheck disable=SC2001,SC2086
+      kaniko_registry_mirror_option="--registry-mirror $(echo ${DOCKER_REGISTRY_MIRROR} | sed "s|^https*://||")"
+    fi
+    log_info "Build & deploy image $docker_image"
+    log_info "Kaniko command: echo $DOCKER_METADATA $DOCKER_BUILD_ARGS $* | xargs /kaniko/executor ${TRACE+--verbosity debug} --context $(docker_context_path) --dockerfile $DOCKER_FILE --destination $docker_image ${kaniko_cache_args} $kaniko_registry_mirror_option"
+    # shellcheck disable=SC2086
+    echo $DOCKER_METADATA $DOCKER_BUILD_ARGS "$@" | xargs /kaniko/executor ${TRACE+--verbosity debug} --context "$(docker_context_path)" --dockerfile "$DOCKER_FILE" --destination "$docker_image" ${kaniko_cache_args} $kaniko_registry_mirror_option
+  }
+
+  function create_dotenv_file() {
+    docker_digest=$1
+    docker_image=${2:-$DOCKER_SNAPSHOT_IMAGE}
+    docker_repository=${docker_image%:*}
+    docker_tag=${docker_image##*:}
+    ans_slug=$(echo "$DOCKER_ARTIFACTS_NAMESPACE" | tr -d '[:punct:]' | tr '[:upper:]' '[:lower:]')
+    var_prefix="${ans_slug:+${ans_slug}_}"
+    dotenvfile="docker.env${ans_slug:+.${ans_slug}}"
+    {
+      echo "docker_${var_prefix}image=$docker_image"
+      echo "docker_${var_prefix}image_digest=$docker_repository@$docker_digest"
+      echo "docker_${var_prefix}repository=$docker_repository"
+      echo "docker_${var_prefix}tag=$docker_tag"
+      echo "docker_${var_prefix}digest=$docker_digest"
+    } > "$dotenvfile"
+    chmod 644 "$dotenvfile"
+  }
+
+  function configure_cosign_private_key() {
+    if [[ -z "${DOCKER_COSIGN_PRIVATE_KEY:-$COSIGN_PRIVATE_KEY}" ]]
+    then
+      fail "Cosign private key is not defined"
+    fi
+    if [[ -f "${DOCKER_COSIGN_PRIVATE_KEY:-$COSIGN_PRIVATE_KEY}" ]]
+    then
+      docker_cosign_private_key=${DOCKER_COSIGN_PRIVATE_KEY:-$COSIGN_PRIVATE_KEY}
+    else
+      mkdir -p /tmp
+      docker_cosign_private_key=$(mktemp)
+      echo "${DOCKER_COSIGN_PRIVATE_KEY:-$COSIGN_PRIVATE_KEY}" > "$docker_cosign_private_key"
+    fi
+    export docker_cosign_private_key
+  }
+
+  function maybe_sign_image() {
+    case "${DOCKER_COSIGN_STRATEGY}" in
+      always)
+        # continue
+        ;;
+      onrelease)
+        if [[ ! "$CI_COMMIT_REF_NAME" =~ ${PROD_REF:1:-1} ]] && [[ ! "$CI_COMMIT_REF_NAME" =~ ${INTEG_REF:1:-1} ]] && [[ ! "$CI_COMMIT_TAG" =~ ${RELEASE_REF:1:-1} ]]
+        then
+          # not a release: skip
+          return
+        fi
+        ;;
+      *)
+        # sign disabled: skip
+        return
+        ;;
+    esac
+
+    ans_slug=$(echo "$DOCKER_ARTIFACTS_NAMESPACE" | tr -d '[:punct:]' | tr '[:upper:]' '[:lower:]')
+    dotenvfile="docker.env${ans_slug:+.${ans_slug}}"
+    # shellcheck disable=SC1090
+    source ./"$dotenvfile"
+    if [[ "$ans_slug" ]]
+    then
+      # unbox namespaced vars
+      docker_image=$(eval echo "docker_\$${ans_slug}_image")
+      docker_image_digest=$(eval echo "docker_\$${ans_slug}_image_digest")
+      docker_repository=$(eval echo "docker_\$${ans_slug}_repository")
+      docker_tag=$(eval echo "docker_\$${ans_slug}_tag")
+      docker_digest=$(eval echo "docker_\$${ans_slug}_digest")
+    fi
+    install_cosign
+    configure_cosign_private_key
+
+    # shellcheck disable=SC2154
+    log_info "Sign image ${docker_image_digest}"
+    # shellcheck disable=SC2154,SC2086
+    echo $DOCKER_COSIGN_ANNOTATIONS | xargs $docker_cosign sign $DOCKER_COSIGN_OPTS --key ${docker_cosign_private_key} ${docker_image_digest}
+  }
+
+  # Used by containers tools like buildah, skopeo.
+  function configure_containers_registries() {
+    if [[ -n "$CONTAINER_REGISTRIES_CONFIG_FILE" ]]
+    then
+      BUILDTOOL_HOME=${BUILDTOOL_HOME:-$HOME}
+      mkdir -p "$BUILDTOOL_HOME/.config/containers"
+      echo "${CONTAINER_REGISTRIES_CONFIG_FILE}" > "$BUILDTOOL_HOME/.config/containers/registries.conf"
+      log_info "Configured $BUILDTOOL_HOME/.config/containers/registries.conf"
+    fi
+  }
+
+  function publish_extra_tags() {
+    if [[ -z "$DOCKER_RELEASE_EXTRA_TAGS" ]]
+    then
+      return
+    fi
+    # check if tag matches pattern
+    maybe_install_python3
+    # shellcheck disable=SC2154
+    matches=$(python3 -c "import re;print('match' if re.match(r'$DOCKER_RELEASE_EXTRA_TAGS_PATTERN', '$docker_tag') else '')")
+    if [[ "$matches" ]]
+    then
+      # apply extra tags substitution
+      extra_tags=$(python3 -c "import re;print(re.sub(r'$DOCKER_RELEASE_EXTRA_TAGS_PATTERN', r'$DOCKER_RELEASE_EXTRA_TAGS', '$docker_tag'))")
+      log_info "Pushing extra tags (evaluated from original tag \\e[33;1m${docker_tag}\\e[0m)..."
+      for extra_tag in $extra_tags
+      do
+        log_info "... pushing extra tag: \\e[33;1m${extra_tag}\\e[0m..."
+        # shellcheck disable=SC2086,SC2154
+        skopeo copy ${TRACE+--debug} --all --src-authfile "$BUILDTOOL_HOME/skopeo/.docker/dest-config.json" --dest-authfile "$BUILDTOOL_HOME/skopeo/.docker/dest-config.json" ${DOCKER_PUBLISH_ARGS} "docker://$DOCKER_RELEASE_IMAGE" "docker://$docker_repository:$extra_tag"
+      done
+    else
+      log_info "Extra tags configured, but the released tag (\\e[33;1m${docker_tag}\\e[0m) doesn't match \$DOCKER_RELEASE_EXTRA_TAGS_PATTERN..."
+    fi
+  }
+
+  init_workspace

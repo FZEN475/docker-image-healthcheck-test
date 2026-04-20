@@ -1,0 +1,143 @@
+# templates/remote-docker/template.yml
+
+stages:
+  - package-test
+
+.diht_scripts: |
+
+  docker info
+  if ! docker pull "$REGISTRY_IMAGE"; then
+    log_error "Failed to pull image: $REGISTRY_IMAGE" >&2
+    exit 1
+  fi
+
+  run_container() {
+    timestamp_from=$(( $(date +%s) - 1 ))
+    container_id=$(docker run -d $DOCKER_HEALTHCHECK_OPTIONS $REGISTRY_IMAGE $DOCKER_HEALTHCHECK_CONTAINER_ARGS)
+    log_info "container_id=$container_id"
+  }
+  
+  function unexpected_error() {
+    log_error "Unexpected error"
+    if [ -n "$container_id" ]
+    then
+      docker logs $container_id
+    fi
+    exit 1
+  }
+  
+  check_health() {
+    waiting_time=0
+    healthcheck_result="timeout"
+  
+    while [ $waiting_time -lt $DOCKER_HEALTHCHECK_TIMEOUT ] \
+      && [ "$healthcheck_result" != "healthy" ] \
+      && [ "$healthcheck_result" != "dead" ]
+    do
+      waiting_time=$(( waiting_time + 5 ))
+      timestamp_to=$(( timestamp_from + waiting_time ))
+    
+      log_info "Testing events between $timestamp_from and $timestamp_to ..."
+    
+      full_result=$(docker events \
+        --filter container=$container_id \
+        --format="{{.Action}}" \
+        --since $timestamp_from \
+        --until $timestamp_to) || unexpected_error
+  
+      if echo "$full_result" | grep ': healthy$' >/dev/null; then
+        healthcheck_result="healthy"
+      
+      elif echo "$full_result" | grep ': unhealthy$' >/dev/null; then
+        log_warn "\\e[93mContainer is unhealthy\\e[0m"
+        healthcheck_result="unhealthy"
+        
+      elif echo "$full_result" | grep '^die$' >/dev/null; then
+        log_error "Container died"
+        healthcheck_result="dead"
+        
+      else
+        healthcheck_result="timeout"
+      fi
+    done
+  }
+  
+  print_diagnostics() {
+    log_info "Container logs:"
+    docker logs $container_id
+  
+    log_info "Docker inspect:"
+    docker inspect $container_id
+  }
+  
+  cleanup_container() {
+    docker stop $container_id >/dev/null 2>&1
+    docker rm $container_id >/dev/null 2>&1
+  
+    max_wait=10
+    waited=0
+  
+    while docker ps -a -q --filter "id=$container_id" | grep -q .; do
+      sleep 1
+      waited=$((waited + 1))
+    
+      if [ $waited -ge $max_wait ]; then
+        log_warn "Container $container_id is not removed after $max_wait seconds"
+        break
+      fi
+    done
+  
+    log_info "Container $container_id stopped and removed"
+  }
+  
+  cleanup_image() {
+    if ! docker rmi $REGISTRY_IMAGE >/dev/null; then
+      log_error "Failed to rmi image: $REGISTRY_IMAGE" >&2
+      exit 1
+    else 
+      log_info "Image $REGISTRY_IMAGE removed"
+    fi
+  }
+  
+  finalize_result() {
+    if [ "$healthcheck_result" == "healthy" ]; then
+      log_info "Container is healthy"
+    else
+      log_error "HealthCheck test error, reason: $healthcheck_result"
+      echo -e "Full logs:\n$full_result"
+      exit 1
+    fi
+  }
+
+docker-remote-healthcheck:
+  image: $DOCKER_IMAGE
+  stage: package-test
+  variables:
+    DOCKER_CLIENT_TIMEOUT: 600
+    COMPOSE_HTTP_TIMEOUT: 600
+  cache:
+    - key: "$CI_COMMIT_REF_SLUG-docker"
+      paths:
+        - .cache
+  before_script:
+    - !reference [ .docker-scripts ]
+  script:
+    - REGISTRY_IMAGE="${REGISTRY_IMAGE:-$DOCKER_SNAPSHOT_IMAGE}"
+    - REGISTRY_IMAGE="${REGISTRY_IMAGE/$CI_REGISTRY/${GLOBAL_REGISTRY_URL:-$CI_REGISTRY}}"
+    - log_info "Healthchecking ${REGISTRY_IMAGE}..."
+    - !reference [.diht_scripts]
+    - |
+      run_container
+      check_health
+      print_diagnostics
+      cleanup_container
+      cleanup_image
+      finalize_result
+  rules:
+    - if: '$DOCKER_HEALTHCHECK_DISABLED == "true"'
+      when: never
+    - if: '$DOCKER_BUILD_TOOL != "dind"'
+      when: on_success
+    - !reference [.test-policy, rules]
+  tags:
+    - docker-builder
